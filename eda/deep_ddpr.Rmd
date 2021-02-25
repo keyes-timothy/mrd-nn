@@ -1,0 +1,103 @@
+---
+title: "Untitled"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# libraries
+library(flowCore)
+library(tidyverse)
+library(tidytof)
+library(foreach)
+library(doParallel)
+library(readxl)
+library(keras)
+
+# parameters
+aml_path <- here::here("data", "aml_data_p.rds")
+healthy_path <- here::here("..", "aml-cells", "data-raw", "healthy_myeloid")
+
+```
+
+# Read in data
+
+```{r}
+aml_data <- 
+  aml_path %>% 
+  read_rds()
+
+aml_data
+```
+
+```{r}
+#healthy data
+healthy_data <- 
+  healthy_path %>% 
+  tof_read_fcs() %>%  #read in everything in the folder
+  tof_preprocess()
+
+# change the column names and remove some irrelevant columns
+healthy_data <- 
+  healthy_data %>% 
+  rename_with( #and then do some renaming to make the names a little nicer
+    .fn = 
+      function(x) str_extract(x, pattern = "_.+") %>% 
+      str_sub(start = 2L), 
+    .cols = contains("_")
+  ) %>% 
+  select(
+    -Time, 
+    -length, 
+    -contains("Pd"), 
+    -Center, 
+    -Offset, 
+    -beadDist, 
+    -`127I`, 
+    -Residual, 
+    -Width, 
+    -cisplatin
+  ) %>%
+  rename(gated_population = name) %>% 
+  mutate(
+    gated_population = 
+      str_extract(gated_population, "_[:alpha:]+") %>% 
+      str_sub(start = 2L)
+  )
+
+healthy_data
+```
+
+# apply mahalanobis classifier
+
+```{r}
+mahalanobis_model <- 
+  tidytof:::tof_classifier_build(
+    tof_tibble = healthy_data, 
+    population_vector = healthy_data$gated_population, 
+    classifier_markers = c("CD34", "CD38", "CD71")
+  )
+
+mahalanobis_model
+```
+
+
+```{r}
+classifier_data <- 
+  aml_data %>% 
+  tidytof:::tof_classifier_apply(
+    classifier_fit = mahalanobis_model, 
+    num_cores = 10, 
+    parallel_var = plate, 
+    dist_fun = "mahalanobis"
+  )
+
+classifier_data
+
+```
+
+
+

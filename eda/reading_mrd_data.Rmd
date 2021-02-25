@@ -1,0 +1,293 @@
+---
+title: "Loading and Preprocessing MRD dataset"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# libraries
+library(flowCore)
+library(tidyverse)
+library(tidytof)
+library(readxl)
+library(keras)
+
+# parameters
+data_path <- here::here("data-raw", "data")
+md_path <- here::here("data-raw", "Metadata.xlsx")
+
+timepoint_levels <- c("Dx", "D8", "D15", "D33", "D78", "Rx")
+risk_levels <- c("SR", "IR", "HR")
+```
+
+# Read in data
+
+```{r}
+# metadata
+metadata <- 
+  md_path %>% 
+  read_excel() %>% 
+  janitor::clean_names()
+
+metadata
+```
+
+
+```{r}
+# single-cell data
+
+# function to clean channel names
+clean_channels <- function(channel_name){ 
+  new_name <- 
+    channel_name %>% 
+    str_to_lower() %>% 
+    str_extract("_.+$") %>% 
+    str_sub(start = 2L)
+  }
+
+all_data <- 
+  data_path %>% 
+  tof_read_fcs()
+
+colnames(all_data)
+```
+
+We can see that the all data has some irrelevant channels. We can filter them out.
+
+```{r}
+all_data <- 
+  all_data %>% 
+  rename_with(.fn = clean_channels, .cols = contains("_")) %>% 
+  rename_with(.fn = str_to_lower) %>% 
+  rename(file_name = name) %>% 
+  select(
+    -time, 
+    -length, 
+    -`127i`, 
+    -`89y`, 
+    -dna1, 
+    -dna2, 
+    -width, 
+    -residual, 
+    -offset, 
+    -beaddist,
+    -center, 
+    -cd16_cd33,
+    -cd235_cd61, 
+    -cisplatin, 
+    -contains("bc")
+  )
+
+colnames(all_data)
+```
+
+
+# Preprocessing 
+
+We can also preprocess the data with the asinh transformation and by removing the noise that the cytof software adds to every set of counts. 
+
+```{r}
+all_data <- 
+  all_data %>%
+  tof_preprocess()
+```
+
+In order to put the data through a feedforward network, we will also have to scale/center each feature (cell-wise). 
+
+# Integrate single-cell and metadata
+
+From here, we can annotate each cell with some variables from the metadata table `md`. 
+
+```{r}
+all_data <- 
+  all_data %>% 
+  left_join(y = metadata, by = "file_name")
+
+all_data
+```
+
+We can also make one more data structure that will be useful later. 
+
+```{r}
+# create an easy lookup for which patients have which mrd risk
+patient_risk <- 
+  all_data %>% 
+  select(patient_id, mrd_risk) %>% 
+  distinct() %>% 
+  drop_na()
+
+patient_risk
+```
+
+
+## Leveling factors
+
+We can also put some factors in order (like `timepoint` and `mrd_risk`) when they have a natural interpretation as "ordered."
+
+```{r}
+all_data <- 
+  all_data %>% 
+  mutate(
+    timepoint = factor(timepoint, levels = timepoint_levels), 
+    mrd_risk = factor(mrd_risk, levels = risk_levels)
+  )
+```
+
+
+# Some quick EDA
+
+## number of patients 
+
+```{r}
+num_patients <- 
+  all_data %>% 
+  count(patient_id) %>% 
+  nrow()
+```
+
+We have samples from `r num_patients` unique patients. 
+
+## Number of samples 
+
+```{r}
+num_samples <- 
+  all_data %>% 
+  count(file_name) %>% 
+  nrow()
+
+```
+
+There are a total of `r num_samples` samples. This means that each patient has multiple samples taken (at different timepoints)
+
+## Number of patients in each risk group
+
+```{r}
+all_data %>% 
+  count(patient_id, mrd_risk) %>% 
+  count(mrd_risk, name = "num_patients")
+```
+
+Here, we can see that one patient doesn't have an mrd risk assessment. So, we can omit the cells from this patient in the rest of our analysis. 
+
+```{r}
+all_data <- 
+  all_data %>% 
+  filter(mrd_risk != "n.a.")
+```
+
+## Number of patients at each timepoint
+
+```{r}
+all_data %>% 
+  count(patient_id, timepoint) %>% 
+  count(timepoint, name = "num_patients") %>% 
+  arrange(-num_patients)
+```
+
+So we can see that only 1 patient has the Day 33 and Day 78 time points, and most have only 3 timepoints: 
+- Dx
+- D8
+- D15
+
+In addition, it seems that 6 patients also have samples from the relapse timepoint. 
+
+
+## Number of cells per timepoint
+
+```{r}
+all_data %>% 
+  mutate(timepoint = factor(timepoint, levels = timepoint_levels)) %>% 
+  count(timepoint, name = "num_cells") %>% 
+  ggplot(aes(x = timepoint, y = num_cells)) + 
+  geom_point()
+```
+
+So we can see that we have way more cells at the first timepoint on average than at the later timepoints (with a resurgence at relapse).
+
+## Number of cells per patient 
+
+```{r}
+patient_cells <- 
+  all_data %>% 
+  count(patient_id, name = "num_cells") %>% 
+  left_join(patient_risk, by = "patient_id") %>% 
+  mutate(patient_id = fct_reorder(patient_id, -num_cells)) %>% 
+  arrange(-num_cells)
+
+patient_cells
+
+patient_cells %>% 
+  ggplot(aes(x = patient_id, y = num_cells, color = mrd_risk)) + 
+  geom_point() + 
+  scale_y_log10() + 
+  coord_flip()
+```
+
+So we can see that some patients have a very small number of cells (several hundred) whereas some patients have up to 500K. 
+
+## Number of cells per patient per timepoint
+
+```{r}
+patient_timepoint_df <- 
+  all_data %>% 
+  count(patient_id, timepoint, name = "num_cells") %>% 
+  left_join(patient_risk, by = "patient_id") %>% 
+  mutate(timepoint = factor(timepoint, levels = timepoint_levels)) %>% 
+  arrange(-num_cells)
+
+patient_timepoint_df 
+
+patient_timepoint_df %>% 
+  ggplot(aes(x = timepoint, y = num_cells, color = mrd_risk)) + 
+  geom_line(aes(group = patient_id), color = "gray", alpha = 0.5) + 
+  geom_point()
+```
+
+It would probably be useful to look at these plots as a percentage of blasts relative to the entire sample. 
+
+## Number of cells per risk group
+
+```{r}
+all_data %>% 
+  count(mrd_risk, name = "num_cells") %>% 
+  arrange(-num_cells)
+```
+
+## Number of cells per risk group per timepoint
+
+```{r}
+risk_timepoint <- 
+  all_data %>% 
+  count(mrd_risk, timepoint, name = "num_cells") %>% 
+  arrange(timepoint, -num_cells)
+
+risk_timepoint 
+
+risk_timepoint %>% 
+  filter(timepoint %in% c("Dx", "D8", "D15", "Rx")) %>% 
+  ggplot(aes(x = timepoint, y = num_cells, color = mrd_risk)) + 
+  geom_line(aes(group = mrd_risk)) + 
+  geom_point() + 
+  scale_y_log10()
+```
+
+
+We can see that the high-risk patients tend to have the highest number of blasts, which makes sense. And from the plot immediately above, we can also see that high-risk and standard-risk groups tend to have the highest number of cells especially at the D8 and D15 timepoints, and that HR is higher at relapse than IR. 
+
+# Save the data
+
+Then we can save the pre-processed data for use later. 
+
+```{r}
+all_data %>% 
+  write_rds(file = here::here("data", "all_data.rds"))
+```
+
+
+
+
+
+
